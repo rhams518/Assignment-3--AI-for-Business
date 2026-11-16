@@ -360,51 +360,192 @@ def movie_document(movie: Dict[str, Any]) -> str:
     return " ".join(parts).strip()
 
 
+
 def rank_recommendations(
     movies: List[Dict[str, Any]],
     natural_query: str,
     sentiment_preference: str,
 ) -> List[Dict[str, Any]]:
-    """Combine TF-IDF content similarity and VADER sentiment matching."""
+    """Combine TF-IDF similarity, sentiment, and mood-aware recommendations."""
     if not movies:
         return []
 
-    documents = [movie_document(movie) or movie["title"] for movie in movies]
-    if natural_query.strip():
+    # NEW: Recognize descriptions of the desired viewing mood.
+    query_lower = natural_query.casefold().strip()
+
+    positive_mood_patterns = [
+        r"\bfeel[\s-]*good\b",
+        r"\buplifting\b",
+        r"\bheart[\s-]*warming\b",
+        r"\bcomfort(?:ing)?\b",
+        r"\bcheer(?:ful|ful up| me up)\b",
+        r"\blight[\s-]*hearted\b",
+        r"\bhappy\b",
+        r"\bwholesome\b",
+        r"\bmake me (?:smile|laugh|happy)\b",
+    ]
+
+    positive_mood = any(
+        re.search(pattern, query_lower)
+        for pattern in positive_mood_patterns
+    )
+
+    # NEW: Avoid interpreting an explicit horror request as feel-good only.
+    explicit_dark_request = bool(
+        re.search(
+            r"\b(horror|scary|terrifying|frightening|slasher)\b",
+            query_lower,
+        )
+    )
+
+    if explicit_dark_request:
+        positive_mood = False
+
+    # NEW: Expand positive-mood requests with relevant movie vocabulary.
+    search_query = natural_query.strip()
+
+    if positive_mood:
+        search_query += (
+            " uplifting heartwarming cheerful wholesome "
+            "lighthearted funny friendship kindness happy "
+            "comedy family romance"
+        )
+
+    documents = [
+        movie_document(movie) or movie["title"]
+        for movie in movies
+    ]
+
+    if search_query:
         try:
-            vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=5000)
-            matrix = vectorizer.fit_transform(documents + [natural_query.strip()])
-            content_scores = cosine_similarity(matrix[-1], matrix[:-1]).flatten()
+            vectorizer = TfidfVectorizer(
+                stop_words="english",
+                ngram_range=(1, 2),
+                max_features=5000,
+            )
+
+            matrix = vectorizer.fit_transform(
+                documents + [search_query]
+            )
+
+            content_scores = cosine_similarity(
+                matrix[-1], matrix[:-1]
+            ).flatten()
+
         except ValueError:
             content_scores = [0.0] * len(movies)
+
     else:
-        # With no text request, popularity provides a sensible discovery order.
+        # Preserve the existing popularity-based discovery behavior.
         import math
 
-        popularity_values = [math.log1p(max(0.0, movie["popularity"])) for movie in movies]
-        max_popularity = max(popularity_values) if popularity_values else 0.0
-        content_scores = [value / max_popularity if max_popularity else 0.0 for value in popularity_values]
+        popularity_values = [
+            math.log1p(max(0.0, movie["popularity"]))
+            for movie in movies
+        ]
+
+        max_popularity = (
+            max(popularity_values) if popularity_values else 0.0
+        )
+
+        content_scores = [
+            value / max_popularity if max_popularity else 0.0
+            for value in popularity_values
+        ]
 
     scored_movies = []
+
     for movie, content_score in zip(movies, content_scores):
-        compound, sentiment_label = get_plot_sentiment(movie["overview"])
+
+        compound, sentiment_label = get_plot_sentiment(
+            movie["overview"]
+        )
+
         movie_copy = dict(movie)
+
         movie_copy["sentiment_score"] = compound
         movie_copy["sentiment_label"] = sentiment_label
 
+        # NEW: Examine actual genre classifications.
+        movie_genres = {
+            genre.casefold()
+            for genre in movie.get("genres", [])
+        }
+
+        # NEW: Exclude genres that directly conflict with
+        # an explicitly positive viewing-mood request.
+        if positive_mood:
+            conflicting_genres = {"horror", "thriller"}
+
+            if movie_genres.intersection(conflicting_genres):
+                continue
+
+        # NEW: Score how well the genre matches a positive mood.
+        mood_score = 0.0
+
+        if positive_mood:
+            feel_good_genres = {
+                "comedy",
+                "family",
+                "romance",
+                "animation",
+                "music",
+            }
+
+            matching_genres = movie_genres.intersection(
+                feel_good_genres
+            )
+
+            mood_score = min(
+                len(matching_genres) / 2.0,
+                1.0,
+            )
+
+            # Positive plot language is supporting evidence,
+            # not the sole measure of a movie's mood.
+            if sentiment_label == "Positive":
+                mood_score = min(mood_score + 0.15, 1.0)
+
+        # Preserve the existing sentiment-preference logic.
         if sentiment_preference == "Any":
             final_score = float(content_score)
             movie_copy["sentiment_match"] = "Not used"
+
         else:
-            sentiment_match = 1.0 if sentiment_label == sentiment_preference else 0.0
-            final_score = (0.80 * float(content_score)) + (0.20 * sentiment_match)
-            movie_copy["sentiment_match"] = "Match" if sentiment_match else "Different tone"
+            sentiment_match = (
+                1.0
+                if sentiment_label == sentiment_preference
+                else 0.0
+            )
+
+            final_score = (
+                0.80 * float(content_score)
+                + 0.20 * sentiment_match
+            )
+
+            movie_copy["sentiment_match"] = (
+                "Match"
+                if sentiment_match
+                else "Different tone"
+            )
+
+        # NEW: Give mood compatibility meaningful ranking weight.
+        if positive_mood:
+            final_score = (
+                0.45 * final_score
+                + 0.55 * mood_score
+            )
 
         movie_copy["content_score"] = float(content_score)
         movie_copy["recommendation_score"] = final_score
+
         scored_movies.append(movie_copy)
 
-    return sorted(scored_movies, key=lambda item: item["recommendation_score"], reverse=True)
+    return sorted(
+        scored_movies,
+        key=lambda item: item["recommendation_score"],
+        reverse=True,
+    )
 
 
 def compare_similar_movies(seed_movie: Dict[str, Any], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
