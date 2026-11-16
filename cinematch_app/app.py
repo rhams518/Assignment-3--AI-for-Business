@@ -33,7 +33,7 @@ st.set_page_config(
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w342"
 CURRENT_YEAR = date.today().year
-MAX_DISCOVERY_RESULTS = 20  # One TMDB page, before detail enrichment.
+MAX_DISCOVERY_RESULTS = 100  # up to five TMDB
 MAX_SIMILAR_RESULTS = 10
 
 GENRES = {
@@ -155,23 +155,64 @@ def search_tmdb_person(name: str, token: str) -> Optional[Dict[str, Any]]:
     return results[0] if results else None
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_movie_list(source: str, params_items: Tuple[Tuple[str, Any], ...], token: str) -> List[Dict[str, Any]]:
-    """Retrieve one page of discover or trending movie results."""
-    movies: List[Dict[str, Any]] = []
-    endpoint = "/trending/movie/week" if source == "Trending this week" else "/discover/movie"
 
-    for page in (1,):
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_movie_list(
+    source: str,
+    params_items: Tuple[Tuple[str, Any], ...],
+    token: str
+) -> List[Dict[str, Any]]:
+    """Retrieve multiple pages of discover or trending movie results."""
+
+    movies: List[Dict[str, Any]] = []
+
+    endpoint = (
+        "/trending/movie/week"
+        if source == "Trending this week"
+        else "/discover/movie"
+    )
+
+    # NEW: Retrieve up to five pages instead of just one.
+    max_pages = 5
+
+    for page in range(1, max_pages + 1):
+
         params = dict(params_items)
         params["page"] = page
-        page_data = cached_tmdb_get(endpoint, tuple(sorted(params.items())), token)
-        movies.extend(page_data.get("results", []))
 
-    # Keep IDs unique and cap the amount of detail enrichment for predictable performance.
+        page_data = cached_tmdb_get(
+            endpoint,
+            tuple(sorted(params.items())),
+            token,
+        )
+
+        page_movies = page_data.get("results", [])
+
+        # NEW: Stop if TMDB returns no more results.
+        if not page_movies:
+            break
+
+        movies.extend(page_movies)
+
+        # NEW: Stop when we reach the desired number of movies.
+        if len(movies) >= MAX_DISCOVERY_RESULTS:
+            break
+
+        # NEW: Respect TMDB's reported number of pages.
+        if page >= page_data.get("total_pages", page):
+            break
+
+    # Preserve the existing duplicate-removal logic.
     unique_movies = {}
+
     for movie in movies:
-        unique_movies[movie.get("id")] = movie
+        movie_id = movie.get("id")
+
+        if movie_id is not None:
+            unique_movies[movie_id] = movie
+
     return list(unique_movies.values())[:MAX_DISCOVERY_RESULTS]
+
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
