@@ -388,6 +388,104 @@ def apply_filters(
 
     return filtered
 
+    
+def analyze_movie_request(query: str) -> Dict[str, Any]:
+    """Extract movie genres, exclusions, and mood preferences."""
+
+    text = query.casefold().strip()
+
+    genre_patterns = {
+        "Action": r"\baction\b",
+        "Adventure": r"\badventure\b",
+        "Animation": r"\b(?:animated|animation|cartoons?)\b",
+        "Comedy": r"\b(?:comedy|comedies|funny|hilarious)\b",
+        "Crime": r"\bcrime\b",
+        "Documentary": r"\bdocumentar(?:y|ies)\b",
+        "Drama": r"\bdrama\b",
+        "Family": r"\b(?:family|kid[ -]friendly|for kids)\b",
+        "Fantasy": r"\bfantasy\b",
+        "History": r"\b(?:history|historical)\b",
+        "Horror": r"\b(?:horror|scary|frightening)\b",
+        "Mystery": r"\bmyster(?:y|ies)\b",
+        "Romance": r"\b(?:romance|romantic)\b",
+        "Science Fiction": r"\b(?:science fiction|sci-fi|scifi)\b",
+        "Thriller": r"\bthriller\b",
+        "War": r"\bwar\b",
+        "Western": r"\bwestern\b",
+    }
+
+    negation_pattern = (
+        r"(?:\bno|\bnot|\bwithout|\bavoid|\bnothing|"
+        r"\bdon't want|\bdont want|\bdo not want)\s+"
+        r"(?:(?:any|a|an|too much|of the)\s+)*$"
+    )
+
+    preferred_genres = []
+    excluded_genres = []
+
+    for genre, pattern in genre_patterns.items():
+        for match in re.finditer(pattern, text):
+
+            prefix = text[
+                max(0, match.start() - 40):match.start()
+            ]
+
+            is_excluded = bool(
+                re.search(negation_pattern, prefix)
+            )
+
+            target = (
+                excluded_genres
+                if is_excluded
+                else preferred_genres
+            )
+
+            if genre not in target:
+                target.append(genre)
+
+    preferred_genres = [
+        genre for genre in preferred_genres
+        if genre not in excluded_genres
+    ]
+
+    positive_mood = bool(re.search(
+        r"\b(?:feel[ -]?good|uplifting|heartwarming|"
+        r"lighthearted|wholesome|cheer me up|"
+        r"make me (?:smile|laugh|happy))\b",
+        text,
+    ))
+
+    avoids_sad = bool(re.search(
+        r"\b(?:no|not|nothing|without|avoid)\s+"
+        r"(?:too\s+)?(?:sad|depressing|tragic|heartbreaking)\b",
+        text,
+    ))
+
+    negative_mood = bool(re.search(
+        r"\b(?:sad|depressing|tragic|heartbreaking|"
+        r"melancholic)\b",
+        text,
+    )) and not avoids_sad
+
+    if re.search(
+        r"\b(?:no|not|without|avoid)\s+"
+        r"(?:a\s+)?(?:feel[ -]?good|uplifting|heartwarming)\b",
+        text,
+    ):
+        positive_mood = False
+
+    if "Horror" in preferred_genres:
+        positive_mood = False
+
+    return {
+        "preferred_genres": preferred_genres,
+        "excluded_genres": excluded_genres,
+        "positive_mood": positive_mood,
+        "negative_mood": negative_mood,
+        "avoids_sad": avoids_sad,
+    }
+
+
 
 def movie_document(movie: Dict[str, Any]) -> str:
     """Build the text representation used by content-based similarity."""
@@ -402,47 +500,31 @@ def movie_document(movie: Dict[str, Any]) -> str:
 
 
 
+
 def rank_recommendations(
     movies: List[Dict[str, Any]],
     natural_query: str,
     sentiment_preference: str,
 ) -> List[Dict[str, Any]]:
-    """Combine TF-IDF similarity, sentiment, and mood-aware recommendations."""
+    """Rank movies using TF-IDF, sentiment, and mood-aware matching."""
+
     if not movies:
         return []
 
-    # NEW: Recognize descriptions of the desired viewing mood.
-    query_lower = natural_query.casefold().strip()
+    # ---------------------------------------------------------
+    # 1. Analyze the user's natural-language request
+    # ---------------------------------------------------------
 
-    positive_mood_patterns = [
-        r"\bfeel[\s-]*good\b",
-        r"\buplifting\b",
-        r"\bheart[\s-]*warming\b",
-        r"\bcomfort(?:ing)?\b",
-        r"\bcheer(?:ful|ful up| me up)\b",
-        r"\blight[\s-]*hearted\b",
-        r"\bhappy\b",
-        r"\bwholesome\b",
-        r"\bmake me (?:smile|laugh|happy)\b",
-    ]
+    request_intent = analyze_movie_request(natural_query)
 
-    positive_mood = any(
-        re.search(pattern, query_lower)
-        for pattern in positive_mood_patterns
-    )
+    positive_mood = request_intent["positive_mood"]
 
-    # NEW: Avoid interpreting an explicit horror request as feel-good only.
-    explicit_dark_request = bool(
-        re.search(
-            r"\b(horror|scary|terrifying|frightening|slasher)\b",
-            query_lower,
-        )
-    )
+    excluded_genres = {
+        genre.casefold()
+        for genre in request_intent["excluded_genres"]
+    }
 
-    if explicit_dark_request:
-        positive_mood = False
-
-    # NEW: Expand positive-mood requests with relevant movie vocabulary.
+    # Expand positive-mood requests with related vocabulary.
     search_query = natural_query.strip()
 
     if positive_mood:
@@ -451,6 +533,10 @@ def rank_recommendations(
             "lighthearted funny friendship kindness happy "
             "comedy family romance"
         )
+
+    # ---------------------------------------------------------
+    # 2. Build movie documents for TF-IDF
+    # ---------------------------------------------------------
 
     documents = [
         movie_document(movie) or movie["title"]
@@ -470,14 +556,16 @@ def rank_recommendations(
             )
 
             content_scores = cosine_similarity(
-                matrix[-1], matrix[:-1]
+                matrix[-1],
+                matrix[:-1]
             ).flatten()
 
         except ValueError:
             content_scores = [0.0] * len(movies)
 
     else:
-        # Preserve the existing popularity-based discovery behavior.
+        # Without a text request, use popularity as the
+        # starting ranking score.
         import math
 
         popularity_values = [
@@ -486,42 +574,60 @@ def rank_recommendations(
         ]
 
         max_popularity = (
-            max(popularity_values) if popularity_values else 0.0
+            max(popularity_values)
+            if popularity_values
+            else 0.0
         )
 
         content_scores = [
-            value / max_popularity if max_popularity else 0.0
+            value / max_popularity
+            if max_popularity
+            else 0.0
             for value in popularity_values
         ]
+
+    # ---------------------------------------------------------
+    # 3. Calculate scores for every movie
+    # ---------------------------------------------------------
 
     scored_movies = []
 
     for movie, content_score in zip(movies, content_scores):
 
-        compound, sentiment_label = get_plot_sentiment(
-            movie["overview"]
-        )
-
         movie_copy = dict(movie)
 
-        movie_copy["sentiment_score"] = compound
-        movie_copy["sentiment_label"] = sentiment_label
-
-        # NEW: Examine actual genre classifications.
         movie_genres = {
             genre.casefold()
             for genre in movie.get("genres", [])
         }
 
-        # NEW: Exclude genres that directly conflict with
-        # an explicitly positive viewing-mood request.
+        # Respect genres explicitly excluded in the request.
+        if movie_genres.intersection(excluded_genres):
+            continue
+
+        # For positive-mood requests, remove genres that
+        # directly conflict with the desired viewing mood.
         if positive_mood:
             conflicting_genres = {"horror", "thriller"}
 
             if movie_genres.intersection(conflicting_genres):
                 continue
 
-        # NEW: Score how well the genre matches a positive mood.
+        # -----------------------------------------------------
+        # 4. Analyze plot sentiment
+        # -----------------------------------------------------
+
+        compound, sentiment_label = get_plot_sentiment(
+            movie["overview"]
+        )
+
+        movie_copy["sentiment_score"] = compound
+        movie_copy["sentiment_label"] = sentiment_label
+
+        # -----------------------------------------------------
+        # 5. Calculate mood compatibility
+        # -----------------------------------------------------
+
         mood_score = 0.0
 
         if positive_mood:
@@ -533,23 +639,30 @@ def rank_recommendations(
                 "music",
             }
 
-            matching_genres = movie_genres.intersection(
-                feel_good_genres
+            matching_positive_genres = (
+                movie_genres.intersection(feel_good_genres)
             )
 
             mood_score = min(
-                len(matching_genres) / 2.0,
+                len(matching_positive_genres) / 2.0,
                 1.0,
             )
 
-            # Positive plot language is supporting evidence,
-            # not the sole measure of a movie's mood.
+            # Positive plot language provides supporting
+            # evidence but does not determine movie mood.
             if sentiment_label == "Positive":
-                mood_score = min(mood_score + 0.15, 1.0)
+                mood_score = min(
+                    mood_score + 0.15,
+                    1.0,
+                )
 
-        # Preserve the existing sentiment-preference logic.
+        # -----------------------------------------------------
+        # 6. Calculate content and sentiment ranking
+        # -----------------------------------------------------
+
         if sentiment_preference == "Any":
             final_score = float(content_score)
+
             movie_copy["sentiment_match"] = "Not used"
 
         else:
@@ -570,17 +683,107 @@ def rank_recommendations(
                 else "Different tone"
             )
 
-        # NEW: Give mood compatibility meaningful ranking weight.
+        # -----------------------------------------------------
+        # 7. Apply mood weighting
+        # -----------------------------------------------------
+
+
         if positive_mood:
             final_score = (
                 0.45 * final_score
                 + 0.55 * mood_score
             )
 
+       
+        # plot sentiment when the user wants to avoid sadness.
+        if request_intent["avoids_sad"]:
+
+            if sentiment_label == "Negative":
+                final_score *= 0.50
+
         movie_copy["content_score"] = float(content_score)
+
         movie_copy["recommendation_score"] = final_score
 
+
+
+        # -----------------------------------------------------
+        # 8. Generate recommendation explanations
+        # -----------------------------------------------------
+
+        reasons = []
+
+        original_movie_genres = set(
+            movie.get("genres", [])
+        )
+
+        requested_genres = set(
+            request_intent["preferred_genres"]
+        )
+
+        matching_genres = original_movie_genres.intersection(
+            requested_genres
+        )
+
+        if matching_genres:
+            reasons.append(
+                "Matches your requested genre: "
+                + ", ".join(sorted(matching_genres))
+            )
+
+        # Explain sentiment preference matches.
+        if (
+            sentiment_preference != "Any"
+            and sentiment_label == sentiment_preference
+        ):
+            reasons.append(
+                f"Matches your {sentiment_preference.lower()} "
+                "plot-sentiment preference"
+            )
+
+        # Explain positive-mood genre matches.
+        if positive_mood:
+            positive_genres = {
+                "Comedy",
+                "Family",
+                "Romance",
+                "Animation",
+                "Music",
+            }
+
+            if original_movie_genres.intersection(
+                positive_genres
+            ):
+                reasons.append(
+                    "Includes genres commonly associated "
+                    "with lighter entertainment"
+                )
+
+        # Explain text similarity when meaningful.
+        if (
+            natural_query.strip()
+            and float(content_score) >= 0.05
+        ):
+            reasons.append(
+                "Has text similarities with your description"
+            )
+
+        if not reasons:
+            reasons.append(
+                "Meets your selected movie filters"
+            )
+
+        movie_copy["recommendation_reasons"] = reasons
+
+        # -----------------------------------------------------
+        # 9. Add THIS movie to the recommendation list
+        # -----------------------------------------------------
+
         scored_movies.append(movie_copy)
+
+    # ---------------------------------------------------------
+    # 10. Sort recommendations from highest to lowest score
+    # ---------------------------------------------------------
 
     return sorted(
         scored_movies,
@@ -588,6 +791,7 @@ def rank_recommendations(
         reverse=True,
     )
 
+    
 
 def compare_similar_movies(seed_movie: Dict[str, Any], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Rank TMDB similar titles with TF-IDF and produce feature-overlap explanations."""
@@ -659,7 +863,10 @@ def display_movie_card(movie: Dict[str, Any], show_recommendation: bool = True) 
         st.subheader(f"{movie['title']} ({year_text})")
 
         if show_recommendation:
-            st.caption(f"Recommendation match: {movie.get('recommendation_score', 0) * 100:.1f}%")
+            st.caption(
+                f"Recommendation score: "
+                f"{movie.get('recommendation_score', 0):.3f}"
+            )
         elif "similarity_score" in movie:
             st.caption(f"Content similarity: {movie['similarity_score'] * 100:.1f}%")
 
@@ -672,6 +879,17 @@ def display_movie_card(movie: Dict[str, Any], show_recommendation: bool = True) 
             f"**Certification:** {movie['certification']}"
         )
         st.write(movie.get("overview", "No plot summary is available."))
+
+        # Show reasons behind the recommendation.
+        if show_recommendation:
+            reasons = movie.get("recommendation_reasons", [])
+
+            if reasons:
+                st.markdown("**Why this movie was recommended:**")
+
+                for reason in reasons:
+                    st.write(f"✓ {reason}")
+
 
         with st.expander("More movie information"):
             st.write(f"**Release date:** {movie.get('release_date') or 'Not available'}")
@@ -810,6 +1028,58 @@ if submitted:
                     if selected_genres:
                         separator = "," if genre_logic == "ALL" else "|"
                         api_params["with_genres"] = separator.join(str(GENRES[name]) for name in selected_genres)
+                    
+                    # Understand the user's natural-language request.
+                    request_intent = analyze_movie_request(natural_query)
+                    positive_mood = request_intent["positive_mood"]
+
+
+                    # Use detected genres only when the user has not
+                    # already selected genres through the interface.
+                    if not selected_genres:
+
+                        detected_genres = request_intent["preferred_genres"]
+
+
+                        if not detected_genres and request_intent["positive_mood"]:
+                            detected_genres = [
+                                "Comedy",
+                                "Family",
+                                "Romance",
+                                "Animation",
+                            ]
+
+                        if detected_genres:
+
+
+                            if (
+                                "Romance" in detected_genres
+                                and "Comedy" in detected_genres
+                            ):
+                                api_params["with_genres"] = ",".join([
+                                    str(GENRES["Romance"]),
+                                    str(GENRES["Comedy"]),
+                                ])
+
+                            else:
+                                # For other multi-genre requests, allow either genre.
+                                api_params["with_genres"] = "|".join(
+                                    str(GENRES[genre])
+                                    for genre in detected_genres
+                                    if genre in GENRES
+                                )
+
+
+                    # Exclude explicitly unwanted genres.
+                    excluded_genres = request_intent["excluded_genres"]
+
+                    if excluded_genres:
+                        api_params["without_genres"] = ",".join(
+                            str(GENRES[genre])
+                            for genre in excluded_genres
+                            if genre in GENRES
+                        )
+
                     if language_label != "Any language":
                         api_params["with_original_language"] = LANGUAGES[language_label]
                     if actor_person:
@@ -853,8 +1123,17 @@ if submitted:
                     st.session_state.pop("similar_results", None)
                     st.session_state.pop("similar_seed_id", None)
 
+
         except (requests.RequestException, RuntimeError, ValueError) as error:
-            st.error(f"There was a problem retrieving movie data: {error}")
+            st.session_state.pop("recommendations", None)
+            st.session_state.pop("similar_results", None)
+            st.session_state.pop("similar_seed_id", None)
+            st.session_state.pop("similar_seed_title", None)
+
+            st.error(
+                "There was a problem retrieving movie recommendations. "
+                "Please check your connection and try again."
+            )
 
 
 # -----------------------------------------------------------------------------
